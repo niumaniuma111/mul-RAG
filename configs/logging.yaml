@@ -1,0 +1,56 @@
+# ============================================================
+# configs/logging.yaml — 日志配置
+# 由 app/core/logging.py 用 dictConfig 加载
+# ============================================================
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  console:
+    format: "%(asctime)s | %(levelname)-7s | %(name)-30s | %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  plain:
+    format: "%(levelname)-7s | %(name)s | %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: console
+    stream: ext://sys.stdout
+
+loggers:
+  app:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  # 屏蔽 httpx 每次请求都打一行 INFO 的噪音
+  httpx:
+    level: WARNING
+    handlers: [console]
+    propagate: false
+  qdrant_client:
+    level: WARNING
+    handlers: [console]
+    propagate: false
+  # uvicorn 自带 handler，这里只调级别，避免日志重复
+  uvicorn:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  uvicorn.error:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  uvicorn.access:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  celery:
+    level: INFO
+    handlers: [console]
+    propagate: false
+
+root:
+  level: WARNING
+  handlers: [console]

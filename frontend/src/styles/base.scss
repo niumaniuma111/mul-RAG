@@ -1,0 +1,42 @@
+/* 全局基础样式：清默认边距、统一字体 */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  font-family:
+    'PingFang SC',
+    'Microsoft YaHei',
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  font-size: 14px;
+  color: #303133;
+  background: #f5f7fa;
+}
+
+/* 引用正文里的 [n] 上标样式（MessageBubble 用） */
+.cite-sup {
+  color: var(--el-color-primary);
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.82em;
+}
+
+/* 滚动条细化 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: #c0c4cc;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

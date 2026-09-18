@@ -1,0 +1,49 @@
+# ============================================================
+# docker-compose.gpu.yml — MinerU 走 GPU 的叠加覆盖文件
+# ------------------------------------------------------------
+# 为什么用叠加文件而不是改主文件：
+#   主 docker-compose.yml 是 CPU 模式，那是最安全的默认路径
+#   （不占显存、与在线问答真并行）。如果直接在主文件里改成 GPU，
+#   默认值就被悄悄改掉了 —— 下次别人 clone 下来直接 up，就会撞上
+#   「上传后问答排队 1-3 分钟」和「随机 OOM」两个坑。
+#
+# 用法（三步）：
+#
+#   ① 改配置 —— 只改一处：
+#        configs/config.yaml → ingest.mineru.device: cuda
+#        或 .env → MINERU_DEVICE=cuda（compose 注入，优先级更高）
+#      lock_backend 保持 auto 不用动，它会自动推导成 redis。
+#
+#   ② 叠加启动：
+#        docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+#   ③ 切回 CPU：
+#        docker compose up -d mineru
+#
+# ⚠️ 切到 GPU 后的用户可见行为变化：
+#    上传文档之后的 1-3 分钟内，所有在线问答请求会排队等待 GPU 锁。
+#    这不是 bug，是 D5 决策的直接后果（省下的后台时间被搬到了交互路径上）。
+#    前端需要明确提示「解析中，问答稍候」。
+#
+# ⚠️ 启动期自检：mineru 与 model-service 启动时都会打印锁层级。
+#    应当看到 lock_backend=redis (ttl=1800s)。若看到 inproc，说明
+#    MINERU_DEVICE 没注入进去（检查 .env），进程会拒绝启动。
+# ============================================================
+
+services:
+  mineru:
+    environment:
+      MINERU_DEVICE: cuda
+      # CPU 交还给其他服务 —— 解析已经下沉到 GPU 了
+      OMP_NUM_THREADS: "2"
+      # MinerU 的低显存分支（<8GB 卡必开）
+      MINERU_VIRTUAL_VRAM_SIZE: "1"
+    # 从 6.0 降回 2.0：解析不再吃 CPU
+    cpus: 2.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

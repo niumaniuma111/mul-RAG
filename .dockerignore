@@ -1,0 +1,56 @@
+# ============================================================
+# .dockerignore — 构建上下文过滤
+# ------------------------------------------------------------
+# ⚠️ 这个文件不是可选优化，是必需项：
+#    三个 Dockerfile 的 build.context 都是项目根目录（`.`），
+#    没有它，Docker CLI 每次构建都会把**整个项目目录**打包上传给 daemon。
+#    S2 下载完模型后 models/ 有 3~4GB —— 每次改一行代码重建镜像，
+#    都要先白传 4GB。加上 .env、storage/、logs/ 还会把密钥和用户数据
+#    一起塞进构建上下文（虽有 .gitignore 但那是 git 的事，管不到 docker）。
+#
+# 已核对：三个 Dockerfile 只 COPY 以下路径，均不在排除名单里 ——
+#    deploy/*.Dockerfile / backend/ / deploy/model-service/requirements.txt
+#    deploy/mineru/{requirements.txt,server.py}
+# 而 models / storage / logs / docs / frontend 全部走 volume 挂载或根本不参与构建。
+# ============================================================
+
+# ---- 模型权重：最大头（3~4GB），走 volume 只读挂载，绝不进镜像 ----
+models/
+
+# ---- 运行时数据：会随使用无限增长，且属用户隐私 ----
+storage/
+logs/
+
+# ---- 前端依赖与产物（frontend 的构建上下文是它自己，不经过这里）----
+frontend/node_modules/
+frontend/dist/
+
+# ---- 密钥：绝不能进镜像层（镜像层的删除不会真正删数据）----
+.env
+.env.local
+.env.*.local
+
+# ---- 版本控制与文档 ----
+.git/
+.gitignore
+docs/
+
+# ---- Python 缓存与虚拟环境 ----
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+.venv/
+venv/
+
+# ---- 编辑器与系统杂物 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ---- 辅助脚本：只在宿主机跑，不需要进镜像 ----
+tools/

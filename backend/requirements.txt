@@ -1,0 +1,59 @@
+# ============================================================
+# backend/requirements.txt — api / worker 容器依赖
+# ------------------------------------------------------------
+# ⚠️ 这里刻意不含 torch / transformers / bitsandbytes。
+#    原因：api 与 worker 都不直接加载模型，全部通过 HTTP 调 model-service。
+#    把它们排除后，api 镜像从 ~3.5GB 降到 ~600MB，构建时间也大幅缩短。
+#    模型侧的依赖在同目录的 requirements-model.txt。
+#
+# 版本依据 DESIGN.md 附录 B。
+# ============================================================
+
+# ---- Web ----
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+sse-starlette==2.2.1
+pydantic==2.10.4
+pydantic-settings==2.7.0
+email-validator==2.2.0              # pydantic EmailStr 的运行时依赖（auth schema 用）
+
+# ---- DB ----
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg[binary,pool]==3.2.3          # LangGraph Postgres checkpointer 用（libpq 驱动）
+alembic==1.14.0
+
+# ---- 异步任务 ----
+celery==5.4.0
+redis==5.2.1
+
+# ---- 向量库 ----
+qdrant-client==1.12.1
+
+# ---- Agent ----
+langgraph==0.2.60
+langgraph-checkpoint-postgres==2.0.9
+langchain-core==0.3.28
+
+# ---- 中文处理（BM25 预处理 / 表格解析）----
+jieba==0.42.1
+lxml==5.3.0
+beautifulsoup4==4.12.3
+
+# ---- 工具 ----
+httpx==0.28.1
+tenacity==9.0.0
+structlog==24.4.0
+python-jose[cryptography]==3.3.0
+# ★ v1.1.8：移除 passlib[bcrypt]==1.7.4，改为直接依赖 bcrypt。
+#   原因：passlib 1.7.4（2020 年后未更新）在加载 bcrypt 后端时会用一个
+#   >72 字节的固定测试串做自检（detect_wrap_bug），而 bcrypt>=4.1 把
+#   "超 72 字节"从静默截断改成了抛异常 —— 于是**任何一次密码哈希都直接 500**，
+#   报错点在 passlib 内部，离业务代码很远。
+#   实测版本组合：passlib 1.7.4 + bcrypt 5.0.0 → ValueError。
+#   直接用 bcrypt 少一层依赖，且 bcrypt 本来就是 passlib[bcrypt] 的传递依赖。
+#   代码见 app/core/security.py；注意调用前要自己截断到 72 字节。
+bcrypt==5.0.0
+python-dotenv==1.0.1
+pyyaml==6.0.2

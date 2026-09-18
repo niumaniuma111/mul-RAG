@@ -1,0 +1,48 @@
+# ============================================================
+# ⛔ 已废弃（DEPRECATED）—— 请勿再用，2026-09-18 起
+# ------------------------------------------------------------
+# 本文件是 S4 期间的**临时补丁层**（坑 23）：S3 的流式 /vlm/generate 当时靠
+# `docker cp` 热拷进容器验证，镜像从未重建 → 容器一 recreate 就退回 S2 的
+# 503 占位实现。本文件用「以现有镜像为底座、只 COPY 应用代码」的方式绕开
+# 重下 torch+CUDA 的漫长构建。
+#
+# ✅ 2026-09-18 18:29 已完成**完整重建并收敛**：
+#    用 STANDARD Dockerfile 重建 pptrag-model-service（21m28s，pip 层重下依赖）
+#    + `docker compose up -d --force-recreate model-service`。
+#    核验：`docker history` 里 `COPY backend/model_service` 由 **2 次降为 1 次**
+#    （补丁层已消失）；`infer_stream`(manager.py)=1、`StreamingResponse`(main.py)=2；
+#    `/embed` 返回 1024 维、已归一化（norm=1.0000），热态 0.41s。
+#
+# ⚠️ 若再用本文件构建，会在标准镜像之上**重新叠一层 COPY**，让
+#    「镜像内 == 磁盘上」这个假设再次失效（坑 18/23 的形态）。
+#    改 model_service 代码请直接用标准 Dockerfile：
+#        docker compose build model-service && \
+#        docker compose up -d --force-recreate model-service
+#
+# 保留此文件仅为记录坑 23 的现场。
+# ============================================================
+# ============================================================
+# deploy/model-service/Dockerfile.codefix — 只刷新应用代码层（原始说明，留档）
+# ------------------------------------------------------------
+# 为什么需要这个文件：
+#   S3 的流式 /vlm/generate 改在 backend/model_service/ 下，但当时的验证
+#   是 docker cp 热拷进容器做的，**镜像从未重建** —— 容器一 recreate 就
+#   退回 S2 的 503 占位实现（"VLM 生成端点尚未实现"）。
+#
+#   正常解法是重建 deploy/model-service/Dockerfile，但它会重跑
+#   `pip install -r requirements.txt`（torch + CUDA，数 GB）。2026-09-18
+#   那次 buildx prune --all 已把构建缓存清空，完整重建要重新下载全部依赖。
+#
+#   本文件用一个「代码层补丁」绕开下载：以现有镜像为底座，只 COPY 应用代码，
+#   产出几 MB 的一层。跑完 S4 验收后，建议在网络宽裕时做一次完整重建，
+#   再用 `docker compose up -d --force-recreate model-service` 收敛回标准镜像。
+#
+# 用法（在项目根执行）：
+#   docker build -f deploy/model-service/Dockerfile.codefix -t pptrag-model-service .
+# ============================================================
+FROM pptrag-model-service
+
+# 与标准 Dockerfile 的 COPY 范围保持一致，避免两个镜像的文件布局漂移
+COPY backend/app/core/ /app/app/core/
+COPY backend/app/__init__.py /app/app/__init__.py
+COPY backend/model_service/ /app/model_service/

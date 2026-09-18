@@ -1,0 +1,29 @@
+# ============================================================
+# deploy/mineru/requirements.txt — MinerU 容器专属依赖
+# ------------------------------------------------------------
+# 这是本项目最重的一个镜像（CPU 版约 7GB），绝大部分体积来自
+# torch（CPU 版）+ opencv + PDF 解析全家桶。
+#
+# ⚠️ 版本锁定（2026-09-17 回填，遵循原注释「首次构建成功后回填实际版本」）
+# ------------------------------------------------------------
+# 原文件刻意不锁版本，本意是"先构建成功再回填"。**首次构建已成功**，
+# 实测装出来的是 **4.0.0** —— 而它与设计文档当初假设的 2.x 架构完全不同
+# （档位 flash/basic/standard/advanced、CLI 变成 client 需配 server、
+#   Content List 出 V1/V2）。整个 `/parse` 实现因这个差异失效过一次。
+# 所以这里必须锁死：否则下次重建悄悄升到 4.1 会再次静默打破解析链路。
+#
+# ⚠️ 连带注意：flash 档的 pptx 解析走 `docvortex.analyzers.native.PptxModel`
+#    （实测 docvortex 0.4.9）。docvortex 是 mineru 的传递依赖，
+#    锁 mineru 不保证锁住它。若某次重建后 pptx 解析行为异常，
+#    先查 `pip show docvortex`。
+#
+# ⚠️ 只装 [core]，不装 [all]：[all] 会拉 vllm —— 那是 GPU 版才需要的，
+#    多出十几个 GB，而本项目 MinerU 默认走 CPU（见 DESIGN.md D5）。
+mineru[core]==4.0.0
+
+# HTTP 包装层
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# GPU 模式下的跨容器锁（与 backend 用同一个 key，见 lock_factory）
+redis==5.2.1

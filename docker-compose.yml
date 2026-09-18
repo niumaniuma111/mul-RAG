@@ -1,0 +1,400 @@
+# ============================================================
+# docker-compose.yml — 默认编排（MinerU 走 CPU 模式）
+# ------------------------------------------------------------
+# ⚠️ 两个必须遵守的执行约定：
+#
+#   1. 从哪里执行 —— 2026-09-17 实测更正（此前本文与 README 断言的
+#      「Windows 侧无法挂载」是**错的**，实测已被推翻）：
+#
+#        · WSL 内（推荐，路径原生、零转发开销）：
+#            cd ~/projects/ppt-agentic-rag && docker compose up -d
+#
+#        · Windows 侧（可行，但需前置条件）：
+#            先在 Docker Desktop 打开
+#              Settings → Resources → WSL Integration → Ubuntu-22.04
+#            开启后，compose 会把 ./models 等相对路径解析成
+#              \\wsl.localhost\Ubuntu-22.04\root\projects\ppt-agentic-rag\...
+#            实测该 UNC 源可被 daemon 正常挂载，build context 也能上传。
+#
+#            未开启该开关时从 Windows 跑，报错为：
+#              accessing specified distro mount service: stat
+#              /run/guest-services/distro-services/ubuntu-22-04.sock: no such file
+#
+#        ⚠️ 性能口径：Windows 侧访问挂载目录要穿一层 9P 转发，
+#           未做基准实测，因此不宣称"性能相同"。项目实体在 ext4 是
+#           §13 的既定决策，不受此处影响；但从 Windows 侧发起 IO 时，
+#           这层转发绕不开。日常开发、批量灌库仍建议走 WSL 内。
+#
+#   2. 首次启动前必须有 .env：
+#        cp .env.example .env && 改掉里面的 CHANGE_ME
+#
+# 本文件**始终是 CPU 模式**，不声明任何 GPU 设备预留。
+# 需要 MinerU 走 GPU 时叠加 docker-compose.gpu.yml，不要改这个文件 ——
+# 否则默认值会被悄悄改掉，而默认值恰恰是这个项目最安全的那条路径。
+#
+# ⚠️ 每容器都显式写了 mem_limit，合计 ≈ 11.4GB，对应 WSL2 分配的 11GB
+#    （超出的部分由 16GB swap 兜底）。加服务时记得同步改这里和
+#    configs/config.yaml 的 resources 段。
+# ============================================================
+
+name: pptrag
+
+# ---- 公共环境片段（YAML anchor，减少重复）----
+x-common-env: &common-env
+  TZ: ${TZ:-Asia/Shanghai}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+# ★ 锁层级推导的唯一输入，必须注入给**所有**需要推导锁的服务。
+#   少注入一个，那个容器就会按 config.yaml 的默认值推导，
+#   而 .env 里改的 MINERU_DEVICE 对它不生效 —— 锁层级会分裂，直接随机 OOM。
+x-mineru-device-env: &mineru-device-env
+  MINERU_DEVICE: ${MINERU_DEVICE:-cpu}
+
+services:
+
+  # ==========================================================
+  # 基础设施
+  # ==========================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: pptrag-postgres
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      <<: *common-env
+      POSTGRES_USER: ${POSTGRES_USER:-pptrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须在 .env 里设置}
+      POSTGRES_DB: ${POSTGRES_DB:-pptrag}
+      # 按 config.yaml 的 memory_tuning.postgres 调低，默认值在 16GB 机器上太奢侈
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=50
+      - -c
+      - effective_cache_size=768MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # ★ init 脚本只在数据卷为空时执行一次。
+      #   改了 SQL 要重建卷：docker compose down -v
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    mem_limit: 1g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pptrag} -d ${POSTGRES_DB:-pptrag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [app-net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: pptrag-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --maxmemory
+      - 320mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "no"          # broker/锁/缓存都可重建，不需要 AOF 落盘
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [app-net]
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: pptrag-qdrant
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      # 16GB 机器上的省内存三件套，对应 config.yaml 的 memory_tuning.qdrant
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+      QDRANT__STORAGE__PERFORMANCE__MEMMAP_THRESHOLD_KB: "20000"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    mem_limit: 1536m
+    cpus: 1.5
+    healthcheck:
+      # qdrant 镜像里没有 curl，用 bash 的 /dev/tcp 探端口
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [app-net]
+
+  # ==========================================================
+  # 应用服务
+  # ==========================================================
+  # ------------------------------------------------------------
+  # storage 权限初始化（一次性、幂等、跑完即退）
+  # ------------------------------------------------------------
+  # ★ 为什么必须有这一层：./storage 是 bind mount，目录属主是宿主用户；
+  #   而 backend 镜像以**非 root** 的 appuser(uid 1000) 运行
+  #   （见 deploy/backend/Dockerfile 的 `USER appuser`），mineru 镜像则是 root。
+  #   不做处理时 appuser 连 uploads/_tmp 都建不出来 —— 上传接口直接
+  #   PermissionError: '/app/storage/uploads/_tmp'（2026-09-17 实测踩到）。
+  #   这里用同一个 backend 镜像以 root 跑一次 chown，把 storage 交回 uid 1000。
+  #   mineru 是 root，写同一目录不受影响（root 无视权限位）。
+  #   2775 = setgid + 组可写：appuser 之后在 storage 下新建的子目录会自动
+  #   继承 gid 1000，不需要再手动 chown。
+  #   做了幂等，所以每次 compose up 都会重跑，不会积累状态。
+  storage-init:
+    build:
+      context: .
+      dockerfile: deploy/backend/Dockerfile
+    image: pptrag-backend:local
+    container_name: pptrag-storage-init
+    restart: "no"
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mkdir -p /app/storage/uploads /app/storage/parsed /app/storage/images
+        /app/storage/vocab /app/logs &&
+        chown -R 1000:1000 /app/storage /app/logs &&
+        find /app/storage -type d -exec chmod 2775 {} + &&
+        echo "storage-init done: $(stat -c '%A %u:%g' /app/storage /app/storage/uploads)"
+    volumes:
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    networks: [app-net]
+
+  api:
+    build:
+      context: .
+      dockerfile: deploy/backend/Dockerfile
+    # ★ 与 worker / storage-init 共用同一个镜像：三者 Dockerfile 与构建上下文
+    #   完全一致，不显式指定 image 名时 compose 会把它构建三遍（每份 656MB）。
+    image: pptrag-backend:local
+    container_name: pptrag-api
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    env_file: [.env]
+    environment:
+      <<: [*common-env, *mineru-device-env]
+    volumes:
+      - ./storage:/app/storage
+      - ./configs:/app/configs:ro
+      - ./logs:/app/logs
+    ports:
+      - "127.0.0.1:8000:8000"
+    mem_limit: 512m
+    cpus: 1.0
+    depends_on:
+      storage-init:  { condition: service_completed_successfully }
+      postgres:      { condition: service_healthy }
+      redis:         { condition: service_healthy }
+      qdrant:        { condition: service_healthy }
+      model-service: { condition: service_started }
+    healthcheck:
+      # ★ 用的是轻量端点（只证明进程活着），不是 /health/deep ——
+      #   后者依赖 PG/Qdrant，下游一抖动就会把 api 容器反复重启，放大故障。
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks: [app-net]
+
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/backend/Dockerfile
+    image: pptrag-backend:local      # 与 api / storage-init 共用，避免重复构建
+    container_name: pptrag-worker
+    restart: unless-stopped
+    # ★ -c 1：单并发。worker 不直接持有模型，串行由 model-service 内部保证；
+    #   开多并发只会让多个任务同时抢 model-service，排队更长、更易 OOM。
+    command: celery -A app.tasks.celery_app worker -l info -c 1 -P prefork
+    env_file: [.env]
+    environment:
+      <<: [*common-env, *mineru-device-env]
+    volumes:
+      - ./storage:/app/storage
+      - ./configs:/app/configs:ro
+      - ./logs:/app/logs
+    mem_limit: 512m
+    cpus: 1.0
+    depends_on:
+      storage-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    networks: [app-net]
+
+  model-service:
+    build:
+      context: .
+      dockerfile: deploy/model-service/Dockerfile
+    container_name: pptrag-model-service
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      <<: [*common-env, *mineru-device-env]
+      CUDA_VISIBLE_DEVICES: "0"
+      # ★ 抗显存碎片化：4bit 量化 + 变长输入下，默认分配器容易留下空洞
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # 全程离线推理：禁止 transformers 去 huggingface 查更新
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ./models:/models:ro
+      - ./configs:/app/configs:ro
+      # ★ /vlm/caption 收到的是**容器内路径**（不是 base64），
+      #   所以必须挂 storage 才能读到图片。且路径要与 worker/api 一致
+      #   （同为 /app/storage），否则同一张图在不同容器里路径不同。
+      #   ro 足够：model-service 只读图，从不写。
+      - ./storage:/app/storage:ro
+    ports:
+      - "127.0.0.1:8002:8002"
+    mem_limit: 3g
+    cpus: 2.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      # 首次要加载 embedding（0.9GB），给足时间
+      start_period: 180s
+    networks: [app-net]
+
+  mineru:
+    build:
+      context: .
+      dockerfile: deploy/mineru/Dockerfile
+    container_name: pptrag-mineru
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      <<: [*common-env, *mineru-device-env]
+      # 限制 OpenMP 线程数，避免 CPU 解析把其他服务一起拖死。
+      # GPU 模式下由 docker-compose.gpu.yml 降为 2。
+      OMP_NUM_THREADS: "6"
+      # ★ MinerU 的所有持久化路径都由 MINERU_HOME 推导（默认 ~/.mineru）：
+      #     $MINERU_HOME/models       权重（config.model.base_dir）
+      #     $MINERU_HOME/config.yaml  配置（记录下载来源等）
+      #     $MINERU_HOME/logs, doclib*
+      #   指到挂载卷后，权重落盘在宿主 ext4 上 ——
+      #   容器重建 / 镜像升级都不会丢，否则每次重下约 1.5GB。
+      MINERU_HOME: /mineru-home
+      # 跳过 huggingface 探测：国内不可达，每次都要先等超时再回落 modelscope
+      # （见 mineru/model/download.py 的 _resolve_auto_model_source）。
+      # ⚠️ 这是 MinerU 自己的 `model.source`，与我们的 MINERU_DEVICE 无关，别混。
+      MINERU_MODEL_SOURCE: modelscope
+    volumes:
+      - ./storage:/app/storage
+      # ★ 2026-09-17 修正：原来是 `./models/mineru:/models:ro` —— 那个挂载**无效**。
+      #   MinerU 从不读 /models，它只认 $MINERU_HOME/models（见 mineru/config.py 的
+      #   _default_path）。实测容器内 /models 一直是空目录，权重实际会下到
+      #   容器临时层（~/.mineru），容器一重建就没了。
+      #   现在改为挂 MINERU_HOME，且**必须可写**：首次要下载权重，
+      #   还要写 config.yaml 记录来源。
+      - ./models/mineru:/mineru-home
+      - ./configs:/app/configs:ro
+    ports:
+      - "127.0.0.1:8001:8001"
+    mem_limit: 3g
+    cpus: 6.0
+    # ★ 这里刻意不声明任何 GPU 预留 —— CPU 模式彻底退出显存竞争。
+    #   切 GPU 由 docker-compose.gpu.yml 追加，见 DESIGN.md §14.2。
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [app-net]
+
+  # ==========================================================
+  # 前端（S4 交付）
+  # ----------------------------------------------------------
+  # 用 profile 隔离：S1 阶段 frontend/ 目录还没有可构建的内容，
+  # 默认 `docker compose up` 不会起它（否则会构建失败挡住验收）。
+  # S4 完成后用 `docker compose --profile frontend up -d` 启用。
+  # ==========================================================
+  nginx:
+    build:
+      context: .
+      dockerfile: deploy/frontend/Dockerfile
+    container_name: pptrag-nginx
+    restart: unless-stopped
+    profiles: ["frontend"]
+    env_file: [.env]
+    environment:
+      <<: *common-env
+    volumes:
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./storage:/usr/share/nginx/storage:ro   # 引用图片静态代理（S4：CitationCard 的 /storage/ 路径）
+    ports:
+      - "8080:80"
+    mem_limit: 128m
+    cpus: 0.5
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      # ⚠️ 必须写 127.0.0.1，不能写 localhost：
+      #    容器内 /etc/hosts 里 localhost 同时映射 127.0.0.1 和 ::1，BusyBox wget
+      #    会先试 ::1 且**不会回退**到 IPv4；而 nginx 的 `listen 80;` 只绑 IPv4
+      #    （0.0.0.0:80），于是健康检查永远 Connection refused → 容器 unhealthy，
+      #    但外部 8080 访问完全正常，极易误判成前端挂了。
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks: [app-net]
+
+# ============================================================
+# 卷
+# ============================================================
+volumes:
+  pgdata:
+  qdrant_data:
+  redis_data:
+
+# ============================================================
+# 网络
+# ------------------------------------------------------------
+# 单一 bridge 网络，服务间用服务名互访（api → http://model-service:8002）。
+# 不需要多网络隔离：本项目单机单租户，多一层网络只会增加排障成本。
+# ============================================================
+networks:
+  app-net:
+    driver: bridge

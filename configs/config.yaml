@@ -1,0 +1,289 @@
+# ============================================================
+# configs/config.yaml — 全量超参唯一来源
+# ------------------------------------------------------------
+# 三条约定：
+#   1. 所有可调参数都在这里，业务代码里不写魔法数字。
+#   2. 密钥类（数据库密码 / JWT_SECRET / 连接串）不在这里，走 .env。
+#   3. resources 段是容器限额，被 docker-compose.yml 与 docker-compose.gpu.yml 读取。
+#
+# 对应设计文档：DESIGN.md §6
+# ============================================================
+
+app:
+  name: "ppt-agentic-rag"
+  env: "prod"                       # dev / prod
+  api_prefix: "/api/v1"
+  cors_origins: ["http://localhost:8080", "http://localhost:5173"]
+
+auth:
+  algorithm: "HS256"
+  access_token_expire_minutes: 1440
+  bcrypt_rounds: 12
+
+paths:
+  storage_root: "/app/storage"
+  upload_dir: "/app/storage/uploads"
+  parsed_dir: "/app/storage/parsed"
+  image_dir: "/app/storage/images"
+  vocab_file: "/app/storage/vocab/bm25_vocab.json"
+  model_root: "/models"
+
+# ------------------------------------------------------------
+# 模型服务（model-service 容器读取此段）
+# ------------------------------------------------------------
+models:
+  vlm:
+    name: "Qwen2.5-VL-3B-Instruct"
+    path: "/models/Qwen2.5-VL-3B-Instruct"
+    load_in_4bit: true
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_compute_dtype: "float16"
+    bnb_4bit_use_double_quant: true
+    device_map: "cuda:0"
+    max_model_len: 4096            # ★ 限制 KV cache，防 OOM
+    max_new_tokens: 1024
+    min_pixels: 200704             # 图片缩放下限（4.x*28*28）
+    max_pixels: 1003520            # ★ 图片缩放上限，显存关键
+    temperature: 0.2
+    top_p: 0.8
+    repetition_penalty: 1.05
+    torch_dtype: "float16"
+    attn_implementation: "sdpa"
+
+  caption:
+    max_new_tokens: 256
+    temperature: 0.3
+    max_pixels: 501760             # caption 阶段图片再压一档
+
+  # ★ S3 新增：在线问答生成（generate / decide / reflect 共用 VLM，无图纯文本）
+  generate:
+    max_new_tokens: 1024
+    temperature: 0.2               # 事实型问答取低温；decide/reflect 需要稳定 JSON
+    top_p: 0.8
+    repetition_penalty: 1.05
+
+  embedding:
+    name: "bge-large-zh-v1.5"
+    path: "/models/bge-large-zh-v1.5"
+    dim: 1024                      # ★ 必须与 Qdrant dense 维度一致
+    max_length: 512
+    batch_size: 16
+    normalize: true
+    device: "cuda:0"
+
+  reranker:
+    name: "bge-reranker-large"
+    path: "/models/bge-reranker-large"
+    max_length: 512
+    batch_size: 4
+    device: "cuda:0"
+    use_fp16: true
+
+  # ★ 显存编排（v1.1 卸载式换出 + 内存优先 ｜ v1.1.3 进程级卸载 + 锁层级自动）
+  manager:
+    mode: "lru_evict"              # lru_evict / resident_all
+    max_resident_gb: 5.8           # ★ 超过此阈值触发换出（可用按"清理桌面后"7.2GB 计，留 1.4GB 缓冲）
+    sys_overhead_gb: 1.4           # CUDA context + 系统显示占用的固定开销
+    keep_resident: ["embedding"]   # 仅 embedder 常驻（0.9G），且不参与互斥
+    evict_to: "discard"            # ★ v1.1 改动：discard（16GB 内存挂不住 CPU 保活）
+    unload_mode: "process"         # ★ v1.1.3：process=子进程 kill（真回收 CUDA context）
+    exclusive_pairs: [["vlm", "reranker"]]   # ★ 二者绝不共存
+    evict_lru_order: ["vlm", "reranker"]
+    idle_ttl_sec: 180              # ★ 空闲 3 分钟即卸载
+    prefetch_before_use: true
+    warmup_on_start: ["embedding"]
+    load_timeout_sec: 180
+
+    # ★ v1.1.7 新增：各操作的超时（秒）。业务代码不写裸数字。
+    #   load     —— 进程冷启 + 读盘 + 反量化（VLM 实测 6-10s，留足余量）
+    #   embed    —— 一批 32 条文本
+    #   rerank   —— 一批候选
+    #   caption  —— 单图 256 token（VLM 3B 4bit，慢）
+    #   generate —— 对话生成 1024 token，S3 用
+    timeouts:
+      load: 180
+      embed: 120
+      rerank: 120
+      caption: 300
+      generate: 900
+    reaper_interval_sec: 30       # 空闲回收线程扫描间隔
+
+    lock_backend: "auto"           # ★ v1.1.3：auto / inproc / redis
+                                   #   auto → 读 ingest.mineru.device 推导：
+                                   #     cpu  → inproc（进程内 asyncio.Lock，仅护 VLM⇄reranker）
+                                   #     cuda → redis（跨容器锁，MinerU 重新参与竞争）
+                                   #   ⚠️ 不要手改成与 device 不匹配的值，否则必 OOM。
+                                   #      启动期 lock_factory 会自检，不匹配直接拒绝启动。
+    gpu_lock:
+      key: "lock:gpu:heavy"
+      acquire_timeout_sec: 180
+      lock_ttl_sec: 600            # ★ auto 模式下 device=cuda 会自动放大到 1800
+      renew_interval_sec: 30
+
+# ------------------------------------------------------------
+# 离线入库
+# ------------------------------------------------------------
+ingest:
+  allowed_ext: [".pptx", ".ppt", ".pdf", ".png"]
+  max_file_size_mb: 200
+
+  mineru:
+    base_url: "http://mineru:8001"
+    timeout_sec: 1800              # ★ CPU 模式解析慢，超时放宽到 30 分钟
+    # ── MinerU 4.0 的解析档位 ──
+    # ⚠️ 2.x 的 backend / lang / formula_enable / table_enable / page_batch_size
+    #    在 4.0 里**不存在**，已于 2026-09-17 实测后整体替换为下面四项。
+    #    传旧键不会报错（请求模型忽略未知字段），只会表现为"配置改了不生效"。
+    tier: "flash"                  # ★★ flash = 原生 OOXML 解析：零权重、零显存、可完全离线
+                                   #    PPT 正文取精确原文（非 OCR）、表格还原成 HTML、
+                                   #    图片取出原始位图。实测断网可跑。
+                                   #    ⚠️ flash **不做 OCR** → 扫描件 PDF 会缺文本。
+                                   #       遇到扫描件把 tier 改成 "standard"（需下模型且占卡，见 D5）
+                                   #    可选值：flash / basic / standard / advanced
+    ocr_mode: "txt"                # auto / txt / ocr；Office 文档在 flash 档恒走 txt
+    page_range: "all"              # ⚠️ 仅 PDF 生效（实测对 pptx 传值会抛 InvalidRequestError，
+                                   #   服务端已按扩展名自动忽略）。显式写 all 是因为
+                                   #   mineru CLI 的 --pages 默认只解析**前 10 页**，
+                                   #   留空靠默认值会让长 PDF 被静默截断
+    image_analysis: true           # 版面内图片分析（flash 档不拉起 VLM，实测可离线）
+    device: "cpu"                  # ★★ v1.1.3 联动开关：cpu（默认）/ cuda（可选加速）
+                                   #   ⚠️ 改这一项会同时改变：显存账、锁层级（lock_backend 自动跟随）、
+                                   #      镜像体积（+13GB）、以及"上传后问答是否被阻塞"。改前先读 D5。
+    cpu_threads: 6                 # 限制线程数，避免占满 CPU 拖垮其他服务（device=cuda 时无效）
+    use_gpu_lock: false            # 由 lock_backend 自动推导，勿手改
+
+  chunk:
+    text:
+      similarity_threshold: 0.65   # ★ 相邻句余弦相似度断点
+      max_tokens: 512              # ★ 兜底硬上限
+      min_tokens: 80               # 过短则与前块合并
+      overlap_tokens: 64
+      sentence_split_chars: ["。", "！", "？", "；", "\n", ".", "!", "?"]
+    table:
+      split: false                 # ★ 整块不切分
+    image_caption:
+      split: false                 # ★ 整块不切分
+
+  # jieba 分词（BM25 预处理）
+  jieba:
+    user_dict: "/app/configs/userdict.txt"
+    cut_all: false
+    min_term_len: 2                # 丢弃单字，降噪
+    remove_stopwords: true
+    stopwords_path: "/app/configs/stopwords_zh.txt"
+    lowercase: true
+
+  bm25:
+    k1: 1.5                        # 仅作参考；Qdrant 的 IDF modifier 内部实现
+    b: 0.75
+    vocab_size_limit: 200000       # vocab 上限，防爆内存
+
+  batch:
+    embed_batch: 32
+    caption_batch: 2               # caption 批大小（显存敏感）
+    upsert_batch: 128              # Qdrant 单批写入点数
+
+# ------------------------------------------------------------
+# 在线检索
+# ------------------------------------------------------------
+retrieval:
+  dense_top_k: 6                   # ★ 向量召回
+  sparse_top_k: 6                  # ★ BM25 召回
+  fusion_mode: "qdrant_server"     # ★ Qdrant 服务端 Fusion.RRF（备选 "client"）
+  rrf_k: 60                        # ★ 仅 fusion_mode=client 时生效；服务端硬编码 60
+  fusion_top_n: 8                  # ★ 融合后取 top8
+  rerank_top_n: 3                  # ★ 重排后保留 top3
+  score_threshold: 0.55            # ★ 低于此分触发 HITL（rerank sigmoid 分）
+                                   #   ⚠️ 不要拿它和 RRF 融合分比 —— RRF 分量纲与阈值完全不同
+                                   #   ★ 2026-09-18 实测标定：sigmoid 中性点≈0.5（无关问题也打 0.5），
+                                   #     相关问题 ~0.62-0.69。设计初值 0.35 永远不触发 HITL（已证伪），
+                                   #     过渡值取 0.55；正式标定在 S5 用标注集回填（§9.5）
+  hitl_enabled: true
+  context_max_tokens: 3000
+  debug_single_route: false        # ★ 排障用：额外发 2 次单路查询拿明细，生产必须 false
+  with_vectors: false              # ★ 检索不回传向量，省内存与带宽
+  filter:
+    require_user_id: true
+    require_is_active: true
+    enable_version_override: true  # ★ 支持指定历史版本问答
+
+# ------------------------------------------------------------
+# Agent / LangGraph
+# ------------------------------------------------------------
+agent:
+  checkpoint:
+    type: "postgres"               # ★ PostgresSaver，支持 interrupt 恢复
+    setup_on_start: true
+  max_wall_clock_sec: 120          # ★ 单次问答墙钟上限，超时强制收尾
+  max_reflect_rounds: 2            # ★ 自省最多重试 2 轮
+  max_total_retrieval: 4           # 总检索次数上限（防 HITL+自省双循环叠加）
+  recursion_limit: 30              # ★ LangGraph 递归上限，硬防死循环
+  max_history_messages: 6
+  sse:
+    heartbeat_sec: 15
+    token_flush_size: 2
+
+# ------------------------------------------------------------
+# 基础设施（连接串从 .env 注入）
+# ------------------------------------------------------------
+postgres:
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+  echo: false
+
+qdrant:
+  collection: "ppt_chunks"
+  grpc_port: 6334
+  prefer_grpc: true
+  timeout_sec: 60
+  upsert_retries: 3
+
+redis:
+  lock_db: 1
+  cache_db: 2
+  broker_db: 0
+  result_db: 3
+
+celery:
+  task_soft_time_limit: 2400       # ★ MinerU CPU 模式解析变慢，放宽
+  task_time_limit: 3000
+  worker_max_tasks_per_child: 20   # 防内存泄漏
+  worker_concurrency: 1            # ★ 单并发，配合 GPU 串行
+  task_acks_late: true
+  worker_prefetch_multiplier: 1    # ★ 不预取，避免第二个任务提前占内存
+
+# ------------------------------------------------------------
+# ★ 容器资源限额（16GB 内存的硬性护栏）
+# 被 docker-compose.yml 读取；合计 ≈ 11.4GB，WSL2 分配 11GB + swap 16GB 兜底
+# ------------------------------------------------------------
+resources:
+  nginx:         { mem_limit: "128m", cpus: "0.5" }
+  api:           { mem_limit: "512m", cpus: "1.0" }
+  worker:        { mem_limit: "512m", cpus: "1.0" }
+  model-service: { mem_limit: "3g",   cpus: "2.0", gpu: true }
+  mineru:        { mem_limit: "3g",   cpus: "6.0" }   # ★ CPU 模式需更多 CPU 与内存
+  postgres:      { mem_limit: "1g",   cpus: "1.0" }
+  redis:         { mem_limit: "384m", cpus: "0.5" }
+  qdrant:        { mem_limit: "1.5g", cpus: "1.5" }
+
+memory_tuning:
+  postgres:
+    shared_buffers: "256MB"
+    work_mem: "8MB"
+    maintenance_work_mem: "64MB"
+    max_connections: 50
+    effective_cache_size: "768MB"
+  redis:
+    maxmemory: "320mb"
+    maxmemory_policy: "allkeys-lru"
+  qdrant:
+    on_disk_payload: true
+    memmap_threshold_kb: 20000
+    hnsw_on_disk: true
+  wsl2:                            # 写入 %USERPROFILE%\.wslconfig
+    memory: "11GB"
+    swap: "16GB"
+    swap_file: "E:\\WSL2test\\wsl_swap.vhdx"
+    processors: 8
+    page_reporting: true

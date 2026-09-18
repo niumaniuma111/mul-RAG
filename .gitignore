@@ -1,0 +1,38 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- 环境与密钥（绝不入库）----
+.env
+.env.local
+*.pem
+*.key
+
+# ---- 运行时数据：全部是挂载卷，不进仓库 ----
+models/
+storage/
+logs/
+pgdata/
+qdrant_data/
+redis_data/
+
+# ---- 前端 ----
+node_modules/
+dist/
+.vite/
+*.local
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 开发探针产物（脚本保留，输出不入库）----
+_e2e_work/out*/

@@ -1,0 +1,63 @@
+# ============================================================
+# deploy/model-service/requirements.txt
+# ------------------------------------------------------------
+# 这是全项目**唯一**加载模型权重的容器，因此也是唯一需要
+# torch / transformers / bitsandbytes 的地方。
+#
+# 版本依据 DESIGN.md 附录 B。
+# ⚠️ torch 要 CUDA 版（本容器用 GPU），从 PyPI 装即可 ——
+#    Linux 上 PyPI 的 torch 默认就是 CUDA 构建。
+# ============================================================
+
+# ---- 模型推理 ----
+torch==2.5.1
+# ★ 2026-09-17 S2 实测补上：漏了它会怎样 ——
+#   `qwen_vl_utils` 在 vision_process.py 顶层就 `import torchvision`，
+#   而它只在 /vlm/caption 真正处理图片时才被导入。
+#   症状：模型**加载成功、显存也占了**，第一次 caption 才报
+#   ModuleNotFoundError: No module named 'torchvision' ——
+#   报错位置离真因（缺依赖）很远，容易误判成模型或权重问题。
+#   版本必须与 torch 2.5.1 配对（0.20.1）；Linux 上 PyPI 版同样是 CUDA 构建。
+torchvision==0.20.1
+transformers==4.49.0                 # Qwen2.5-VL 需要 >= 4.49
+accelerate==1.2.1
+bitsandbytes==0.45.0                 # 4bit nf4 量化
+sentence-transformers==3.3.1         # ★ 一个库同时供两个角色：
+                                     #   · BGE-large-zh-v1.5（embedder）→ SentenceTransformer
+                                     #   · bge-reranker-large（reranker）→ CrossEncoder
+qwen-vl-utils==0.0.10
+
+# ⚠️ 为什么**不**用 FlagEmbedding（2026-09-17 构建实测后移除）
+# ------------------------------------------------------------
+# FlagEmbedding==1.3.3 硬依赖 transformers==4.44.2，而 Qwen2.5-VL 要求 >=4.49，
+# pip 直接 ResolutionImpossible 构建失败：
+#     The conflict is caused by:
+#         The user requested transformers==4.49.0
+#         sentence-transformers 3.3.1 depends on transformers<5.0.0 and >=4.41.0
+#         flagembedding 1.3.3 depends on transformers==4.44.2
+#
+# 它的最新版 1.4.2 虽已放宽为 transformers<6.0.0,>=4.44.2，但会额外拉入
+# datasets / peft / ir-datasets / sentencepiece 等重依赖 —— 而本项目只需要
+# 「加载 BGE-reranker-large」这一个能力，不值得。
+#
+# BGE 系列 reranker 用 CrossEncoder 加载是 BAAI 官方 README 给出的两种方式之一
+# （另一种才是 FlagEmbedding 的 FlagReranker），结果等价而依赖树干净得多。
+#
+#   ⚠️ S2 实现 rerank 端点时注意一处差异：
+#       CrossEncoder.predict() 返回**未归一化 logits**，
+#       要过 torch.sigmoid 才是 0~1 的相关性分数（FlagReranker 默认已归一化）。
+
+# ---- 图像处理（VLM 输入预处理）----
+pillow==11.0.0
+
+# ---- HTTP 服务 ----
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# ---- 配置与锁（复用 backend 的 app.core）----
+pydantic==2.10.4
+pydantic-settings==2.7.0
+pyyaml==6.0.2
+redis==5.2.1
+httpx==0.28.1
