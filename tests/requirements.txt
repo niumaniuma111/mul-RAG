@@ -1,0 +1,3 @@
+pytest>=8.0
+requests>=2.31
+allure-pytest>=2.13   # 可选：装了才有 Allure 报告，不装测试照常跑
