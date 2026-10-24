@@ -47,7 +47,7 @@ def new_user(fresh_client: ApiClient) -> ApiClient:
     """注册并登录一个一次性用户（用例结束即弃，不清理——注册不可删）。"""
     suffix = uuid.uuid4().hex[:10]
     username = f"api_test_{suffix}"
-    resp = fresh_client.register(username, "Test!Pass_2026", f"{username}@test.local")
+    resp = fresh_client.register(username, "Test!Pass_2026", f"{username}@example.com")
     assert resp.status_code == 201, f"注册失败: {resp.text[:200]}"
     assert fresh_client.login(username, "Test!Pass_2026").status_code == 200
     return fresh_client

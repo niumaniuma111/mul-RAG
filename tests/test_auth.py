@@ -18,7 +18,7 @@ class TestAuthLogin:
         """AUTH-001 有效注册并登录成功"""
         suffix = uuid.uuid4().hex[:10]
         username = f"{CASE_PREFIX.lower()}_{suffix}"
-        assert_ok(fresh_client.register(username, "Test!Pass_2026", f"{username}@t.local"), http=201)
+        assert_ok(fresh_client.register(username, "Test!Pass_2026", f"{username}@example.com"), http=201)
         data = assert_ok(fresh_client.login(username, "Test!Pass_2026"))
         assert data["access_token"] and data["username"] == username
 

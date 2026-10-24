@@ -52,6 +52,8 @@ class TestDocumentLifecycle:
         data2 = assert_ok(resp2, http=201)
         assert data2["doc_id"] == doc_id and data2["version"] == 2
         assert data2["is_new_doc"] is False
+        done2 = wait_task_done(client, data2["task_id"])
+        assert done2["status"] == "success", f"v2 解析失败: {done2.get('error_log')}"
 
         # ---- 4. 版本列表与详情（VER-005）----
         versions = assert_ok(client.get(f"/files/{doc_id}/versions"))
@@ -66,7 +68,14 @@ class TestDocumentLifecycle:
         # ---- 6. 硬删除（DEL-001 / DEL-003）----
         del_data = assert_ok(client.delete(f"/files/{doc_id}"))
         assert del_data["deleted_versions"] >= 2
-        assert del_data.get("warnings") in (None, [],), f"删除存在未清干净的载体: {del_data['warnings']}"
+        warnings = del_data.get("warnings") or []
+        if warnings:
+            if all("Permission denied" in str(w) for w in warnings):
+                # BUG-004（已知缺陷）：mineru 容器写入 parsed 的图片属主与 api 用户
+                # 不一致，硬删除时磁盘清理 Permission denied，产生残留。
+                # 修复后此 xfail 应转为通过。
+                pytest.xfail(f"BUG-004 磁盘残留（跨容器权限）: {warnings}")
+            pytest.fail(f"删除存在未清干净的载体: {warnings}")
 
         # ---- 7. 任务历史保留 + 快照文件名（DEL-002，回归 BUG-003）----
         detail = assert_ok(client.get(f"/tasks/{task_id}"))

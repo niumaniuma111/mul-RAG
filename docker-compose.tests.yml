@@ -1,0 +1,6 @@
+# 本地测试覆盖文件：宿主机已有 ZenTao 自带 Redis 占用 6379，
+# 去掉 redis 的宿主机端口映射（api/worker 走 compose 内部网络，不受影响）。
+# 用法：docker compose -f docker-compose.yml -f docker-compose.tests.yml up -d ...
+services:
+  redis:
+    ports: !override []
