@@ -288,6 +288,27 @@ def _materialize_images(
     return written, mapping
 
 
+def _relax_permissions(out_dir: Path) -> None:
+    """
+    BUG-004 修复：mineru 容器以 root 运行，写出的解析产物（目录+文件）属主为
+    root，而 api/worker 以 appuser(uid 1000) 运行 —— 硬删除清理
+    /app/storage/parsed/{doc}/ 时 Permission denied，磁盘残留。
+
+    写完后放宽权限：目录 0o777、文件 0o666，让删除链路三处零残留成立。
+    （更彻底的方案是 mineru 与 api 统一运行用户；本方案不换属主、不动部署，
+    由 root 对自己写出的文件 chmod 即可，重建一层镜像即生效。）
+    """
+    try:
+        out_dir.chmod(0o777)
+        for p in out_dir.rglob("*"):
+            try:
+                p.chmod(0o777 if p.is_dir() else 0o666)
+            except OSError:  # noqa: BLE001, S110 —— 单个文件放宽失败不阻断解析
+                pass
+    except OSError:  # noqa: BLE001, S110 —— 权限放宽失败等同旧行为，由删除链路 warning 兜底
+        pass
+
+
 # ============================================================
 # 解析（同步，跑在线程里）
 # ============================================================
@@ -368,6 +389,8 @@ def _parse_sync(req: ParseRequest) -> dict[str, Any]:
     for item in items:
         key = str(item.get("type") or "unknown")
         counts[key] = counts.get(key, 0) + 1
+
+    _relax_permissions(out_dir)
 
     return {
         "status": "ok",
